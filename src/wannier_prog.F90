@@ -67,11 +67,48 @@ program wannier
 
   implicit none
 
+! integer, save :: rpt_origin
+  !! index of R=0
+! integer, save :: nrpts
+  !! number of Wigner-Seitz grid points
+! integer, save, allocatable :: irvec(:, :)
+  !!  The irpt-th Wigner-Seitz grid point has components
+  !! irvec(1:3,irpt) in the basis of the lattice vectors
+! integer, save, allocatable :: shift_vec(:, :)
+! integer, save, allocatable :: ndegen(:)
+  !! Weight of the irpt-th point is 1/ndegen(irpt)
+! real(kind=dp), save, allocatable :: wannier_centres_translated(:, :)
+! complex(kind=dp), save, allocatable :: ham_r(:, :, :)
+  !! Hamiltonian matrix in WF representation
+
+  integer :: rpt_origin
+  !! index of R=0
+  integer :: nrpts
+  !! number of Wigner-Seitz grid points
+  integer, allocatable :: irvec(:, :)
+  !!  The irpt-th Wigner-Seitz grid point has components
+  !! irvec(1:3,irpt) in the basis of the lattice vectors
+  integer, allocatable :: shift_vec(:, :)
+  integer, allocatable :: ndegen(:)
+  !! Weight of the irpt-th point is 1/ndegen(irpt)
+  real(kind=dp), allocatable :: wannier_centres_translated(:, :)
+  complex(kind=dp), allocatable :: ham_r(:, :, :)
+  !! Hamiltonian matrix in WF representation
+
+  complex(kind=dp), allocatable :: ham_k(:, :, :)
+
   real(kind=dp) time0, time1, time2
   character(len=9) :: stat, pos, cdate, ctime
   logical :: wout_found, dryrun
   integer :: len_seedname
   character(len=50) :: prog
+
+  type(sitesym_data) :: sym !JJ
+
+! logical :: ham_have_setup = .false.
+! logical :: have_translated = .false.
+! logical :: use_translation = .false.
+  type(ham_logical) :: hmlg
 
   call comms_setup
 
@@ -128,7 +165,10 @@ program wannier
     time1 = io_time()
     write (stdout, '(1x,a25,f11.3,a)') 'Time to read parameters  ', time1 - time0, ' (sec)'
 
-    if (.not. explicit_nnkpts) call kmesh_get
+    if (.not. explicit_nnkpts) call kmesh_get(recip_lattice, kpt_cart, timing_level, nncell, neigh, &
+                                              nnlist, nntot, shell_list, devel_flag, iprint, lenconfac, &
+                                              kmesh_tol, num_kpts, search_shells, gamma_only, nnh, wbtot, &
+                                              skip_B1_tests, bk, bka, wb, num_shells, length_unit)
     time2 = io_time()
     write (stdout, '(1x,a25,f11.3,a)') &
       'Time to get kmesh        ', time2 - time1, ' (sec)'
@@ -160,7 +200,8 @@ program wannier
   else                      ! restart a previous calculation
     if (on_root) call param_read_chkpt()
     call param_chkpt_dist
-    if (lsitesymmetry) call sitesym_read()   ! update this to read on root and bcast - JRY
+    if (lsitesymmetry) call sitesym_read(num_bands, num_wann, num_kpts, sym)   ! update this to read on root and bcast - JRY
+    if (lsitesymmetry) sym%symmetrize_eps = symmetrize_eps ! for the time being, copy value from w90_parameters  (JJ)
 
     select case (restart)
     case ('default')    ! continue from where last checkpoint was written
@@ -190,8 +231,12 @@ program wannier
   endif
 
   if (postproc_setup) then
-    if (on_root) call kmesh_write()
-    call kmesh_dealloc()
+    if (on_root) call kmesh_write(recip_lattice, timing_level, nncell, nnlist, nntot, num_kpts, &
+                                  input_proj_l, num_proj, input_proj_site, spinors, kpt_latt, real_lattice, &
+                                  calc_only_A, input_proj_zona, input_proj_x, input_proj_z, input_proj_radial, &
+                                  input_proj_m, exclude_bands, num_exclude_bands, auto_projections, &
+                                  input_proj_s_qaxis, input_proj_s)
+    call kmesh_dealloc(nncell, neigh, nnlist, bk, bka, wb)
     call param_dealloc()
     if (on_root) write (stdout, '(1x,a25,f11.3,a)') 'Time to write kmesh      ', io_time(), ' (sec)'
     if (on_root) write (stdout, '(/a)') ' Exiting... '//trim(seedname)//'.nnkp written.'
@@ -199,9 +244,15 @@ program wannier
     stop
   endif
 
-  if (lsitesymmetry) call sitesym_read()   ! update this to read on root and bcast - JRY
-  call overlap_allocate()
-  call overlap_read()
+  if (lsitesymmetry) call sitesym_read(num_bands, num_wann, num_kpts, sym)   ! update this to read on root and bcast - JRY
+  if (lsitesymmetry) sym%symmetrize_eps = symmetrize_eps ! for the time being, copy value from w90_parameters  (JJ)
+
+  call overlap_allocate(u_matrix, m_matrix_local, m_matrix, u_matrix_opt, a_matrix, m_matrix_orig_local, &
+                        m_matrix_orig, timing_level, nntot, num_kpts, num_wann, num_bands, disentanglement)
+  call overlap_read(lsitesymmetry, m_matrix_orig_local, m_matrix_local, gamma_only, use_bloch_phases, &
+                    cp_pp, u_matrix_opt, m_matrix_orig, timing_level, a_matrix, m_matrix, u_matrix, &
+                    devel_flag, proj2wann_map, lselproj, num_proj, nnlist, nncell, nntot, num_kpts, &
+                    num_wann, num_bands, disentanglement, sym)
 
   time1 = io_time()
   if (on_root) write (stdout, '(/1x,a25,f11.3,a)') 'Time to read overlaps    ', time1 - time2, ' (sec)'
@@ -209,7 +260,20 @@ program wannier
   have_disentangled = .false.
 
   if (disentanglement) then
-    call dis_main()
+    if (.not. allocated(dis_spheres)) then ! this is *sometimes* true for non-root mpi tasks (depending on input options)
+      allocate (dis_spheres(1, 1)) !JJ temporary workaround to avoid runtime check failure
+    endif
+
+    !call dis_main()
+    call dis_main(num_kpts, nntot, num_wann, num_bands, dis_spheres_num, &
+                  dis_num_iter, dis_spheres_first_wann, dis_conv_window, timing_level, &
+                  num_nodes, my_node_id, optimisation, iprint, nnlist, ndimwin, dis_win_min, &
+                  dis_win_max, dis_froz_min, dis_froz_max, dis_mix_ratio, dis_conv_tol, &
+                  wbtot, lenconfac, omega_invariant, eigval, recip_lattice, kpt_latt, &
+                  dis_spheres, wb, devel_flag, length_unit, lsitesymmetry, gamma_only, &
+                  on_root, frozen_states, lwindow, u_matrix, u_matrix_opt, m_matrix, &
+                  m_matrix_local, m_matrix_orig, m_matrix_orig_local, a_matrix, sym)
+
     have_disentangled = .true.
     time2 = io_time()
     if (on_root) write (stdout, '(1x,a25,f11.3,a)') 'Time to disentangle bands', time2 - time1, ' (sec)'
@@ -220,10 +284,51 @@ program wannier
 
 1001 time2 = io_time()
 
+  ! JJ hack to workaround mpi_scatterv requirement that all arrays are valid *for all mpi procs*
+  ! m_matrix* usually alloc'd in overlaps.F90, but not always
+  if (.not. allocated(m_matrix)) allocate (m_matrix(1, 1, 1, 1)) !JJ temporary workaround to avoid runtime check failure
+
   if (.not. gamma_only) then
-    call wann_main()
+    call wann_main(num_wann, num_cg_steps, num_iter, nnlist, nntot, &
+                   wbtot, u_matrix, m_matrix, num_kpts, iprint, &
+                   num_print_cycles, num_dump_cycles, omega_invariant, &
+                   length_unit, lenconfac, proj_site, real_lattice, &
+                   write_r2mn, guiding_centres, num_guide_cycles, &
+                   num_no_guide_iter, timing_level, trial_step, precond, &
+                   fixed_step, lfixstep, write_proj, have_disentangled, &
+                   conv_tol, num_proj, conv_window, conv_noise_amp, &
+                   conv_noise_num, wannier_centres, write_xyz, &
+                   wannier_spreads, omega_total, omega_tilde, &
+                   optimisation, write_vdw_data, write_hr_diag, kpt_latt, &
+                   bk, ccentres_cart, slwf_num, selective_loc, &
+                   slwf_constrain, slwf_lambda, neigh, nnh, bka, &
+                   num_bands, u_matrix_opt, eigval, lwindow, wb, &
+                   translate_home_cell, recip_lattice, num_atoms, &
+                   atoms_symbol, atoms_pos_cart, num_species, &
+                   atoms_species_num, num_valence_bands, &
+                   num_elec_per_state, lsitesymmetry, stdout, &
+                   ws_distance_tol, ws_search_size, real_metric, mp_grid, &
+                   transport_mode, bands_plot_mode, transport, bands_plot, &
+                   translation_centre_frac, automatic_translation, ndimwin, sym, &
+                   ham_r, irvec, shift_vec, ndegen, nrpts, rpt_origin, &
+                   wannier_centres_translated, &
+                   hmlg, ham_k)
+
   else
-    call wann_main_gamma()
+    call wann_main_gamma(num_wann, num_iter, wb, nntot, u_matrix, m_matrix, &
+                         num_kpts, iprint, num_print_cycles, &
+                         num_dump_cycles, omega_invariant, length_unit, &
+                         lenconfac, proj_site, real_lattice, write_r2mn, &
+                         guiding_centres, num_guide_cycles, &
+                         num_no_guide_iter, timing_level, write_proj, &
+                         have_disentangled, conv_tol, conv_window, &
+                         wannier_centres, write_xyz, wannier_spreads, &
+                         omega_total, omega_tilde, write_vdw_data, neigh, &
+                         nnh, bk, bka, num_bands, u_matrix_opt, eigval, &
+                         lwindow, wbtot, translate_home_cell, &
+                         recip_lattice, num_atoms, atoms_symbol, &
+                         atoms_pos_cart, num_species, atoms_species_num, &
+                         num_valence_bands, num_elec_per_state, stdout)
   end if
 
   time1 = io_time()
@@ -236,7 +341,24 @@ program wannier
     ! I call the routine always; the if statements to decide if/what
     ! to plot are inside the function
     time2 = io_time()
-    call plot_main()
+    !
+    call plot_main(num_kpts, bands_plot, dos_plot, kpt_latt, fermi_surface_plot, wannier_plot, &
+                   timing_level, write_bvec, write_hr, write_rmn, write_tb, write_u_matrices, &
+                   real_lattice, num_wann, wb, bk, m_matrix, nntot, recip_lattice, wannier_centres, &
+                   num_atoms, atoms_pos_cart, translation_centre_frac, automatic_translation, &
+                   num_species, atoms_species_num, lenconfac, have_disentangled, ndimwin, lwindow, &
+                   u_matrix_opt, eigval, u_matrix, lsitesymmetry, num_bands, ws_distance_tol, &
+                   ws_search_size, real_metric, mp_grid, transport_mode, bands_plot_mode, transport, &
+                   iprint, wannier_plot_radius, wannier_plot_scale, atoms_pos_frac, &
+                   wannier_plot_spinor_phase, wannier_plot_spinor_mode, spinors, wannier_plot_format, &
+                   wvfn_formatted, wannier_plot_mode, wannier_plot_list, num_wannier_plot, &
+                   atoms_symbol, spin, wannier_plot_supercell, fermi_energy_list, nfermi, &
+                   fermi_surface_num_points, one_dim_dir, bands_plot_dim, hr_cutoff, dist_cutoff, &
+                   dist_cutoff_mode, use_ws_distance, bands_plot_project, num_bands_project, &
+                   bands_plot_format, bands_label, bands_spec_points, bands_num_spec_points, &
+                   recip_metric, bands_num_points, ham_r, irvec, shift_vec, ndegen, nrpts, rpt_origin, &
+                   wannier_centres_translated, hmlg, ham_k)
+    !
     time1 = io_time()
     ! Now time is always printed, even if no plotting is done/required, but
     ! it shouldn't be a problem.
@@ -247,7 +369,19 @@ program wannier
   if (on_root) then
     time2 = io_time()
     if (transport) then
-      call tran_main()
+      call tran_main(transport_mode, tran_read_ht, timing_level, write_hr, write_xyz, num_wann, &
+                     real_lattice, recip_lattice, wannier_centres, num_atoms, bands_plot, iprint, &
+                     translation_centre_frac, automatic_translation, num_species, atoms_species_num, &
+                     lenconfac, have_disentangled, ndimwin, lwindow, u_matrix_opt, kpt_latt, &
+                     eigval, u_matrix, lsitesymmetry, num_bands, num_kpts, atoms_pos_cart, &
+                     ws_distance_tol, ws_search_size, real_metric, mp_grid, bands_plot_mode, transport, &
+                     dist_cutoff_hc, dist_cutoff, dist_cutoff_mode, tran_num_bandc, tran_num_cc, &
+                     tran_num_rr, tran_num_lc, tran_num_cr, tran_write_ht, fermi_energy_list, nfermi, &
+                     kpt_cart, tran_num_ll, tran_num_cell_ll, tran_easy_fix, atoms_symbol, &
+                     wannier_spreads, tran_group_threshold, one_dim_dir, tran_use_same_lead, &
+                     tran_energy_step, tran_win_min, tran_win_max, tran_num_bb, length_unit, hr_cutoff, &
+                     ham_r, irvec, shift_vec, ndegen, nrpts, rpt_origin, wannier_centres_translated, &
+                     hmlg, ham_k)
       time1 = io_time()
       write (stdout, '(1x,a25,f11.3,a)') 'Time for transport       ', time1 - time2, ' (sec)'
       if (tran_read_ht) goto 4004
@@ -255,11 +389,13 @@ program wannier
   endif
 
   call tran_dealloc()
-  call hamiltonian_dealloc()
-  call overlap_dealloc()
-  call kmesh_dealloc()
+  call hamiltonian_dealloc(ham_r, irvec, ndegen, wannier_centres_translated, &
+                           hmlg, ham_k)
+  call overlap_dealloc(m_matrix_orig_local, m_matrix_local, u_matrix_opt, &
+                       a_matrix, m_matrix_orig, m_matrix, u_matrix)
+  call kmesh_dealloc(nncell, neigh, nnlist, bk, bka, wb)
   call param_dealloc()
-  if (lsitesymmetry) call sitesym_dealloc() !YN:
+  if (lsitesymmetry) call sitesym_dealloc(sym) !YN:
 
 4004 continue
 
