@@ -76,6 +76,9 @@ contains
     complex(kind=dp), allocatable :: UU(:, :)
     real(kind=dp) :: del_eig(num_wann, 3)
     real(kind=dp) :: eig(num_wann), levelspacing_k(num_wann)
+    !yyx begin
+    character*70 :: fmt
+    !yyx end
 
     num_freq = nint((dos_energy_max - dos_energy_min)/dos_energy_step) + 1
     if (num_freq == 1) num_freq = 2
@@ -179,6 +182,12 @@ contains
 
       if (on_root) write (stdout, '(/,1x,a)') 'Sampling the full BZ'
 
+      ! yyx begin
+      open(71, file='kmesh.dat', status='replace')
+      open(72, file='hk.dat', status='replace')
+      write(fmt, '("(",i0,"f20.12)")')2*num_wann*num_wann
+      ! yyx end
+
       kweight = 1.0_dp/real(PRODUCT(dos_kmesh), kind=dp)
       do loop_tot = my_node_id, PRODUCT(dos_kmesh) - 1, num_nodes
         loop_x = loop_tot/(dos_kmesh(2)*dos_kmesh(3))
@@ -207,7 +216,18 @@ contains
                          UU=UU)
         end if
         dos_all = dos_all + dos_k*kweight
+
+        !yyx begin
+        write(71, '(3f15.10)') kpt
+        write(72, fmt) HH
+        !yyx end
+
       end do
+
+      !yyx begin
+      close(71)
+      close(72)
+      !yyx end
 
     end if
 
